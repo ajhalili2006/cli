@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
@@ -45,12 +49,13 @@ func NewCmdDownload(f *cmdutil.Factory, runF func(*DownloadOptions) error) *cobr
 	cmd := &cobra.Command{
 		Use:   "download [<tag>]",
 		Short: "Download release assets",
-		Long: heredoc.Doc(`
+		Long: heredoc.Docf(`
 			Download assets from a GitHub release.
 
 			Without an explicit tag name argument, assets are downloaded from the
-			latest release in the project. In this case, '--pattern' is required.
-		`),
+			latest release in the project. In this case, %[1]s--pattern%[1]s or %[1]s--archive%[1]s
+			is required.
+		`, "`"),
 		Example: heredoc.Doc(`
 			# download all assets from a specific release
 			$ gh release download v1.2.3
@@ -139,17 +144,19 @@ func downloadRun(opts *DownloadOptions) error {
 		return err
 	}
 
-	opts.IO.StartProgressIndicator()
+	opts.IO.StartProgressIndicatorWithLabel("Finding assets to download")
 	defer opts.IO.StopProgressIndicator()
+
+	ctx := context.Background()
 
 	var release *shared.Release
 	if opts.TagName == "" {
-		release, err = shared.FetchLatestRelease(httpClient, baseRepo)
+		release, err = shared.FetchLatestRelease(ctx, httpClient, baseRepo)
 		if err != nil {
 			return err
 		}
 	} else {
-		release, err = shared.FetchRelease(httpClient, baseRepo, opts.TagName)
+		release, err = shared.FetchRelease(ctx, httpClient, baseRepo, opts.TagName)
 		if err != nil {
 			return err
 		}
@@ -169,6 +176,12 @@ func downloadRun(opts *DownloadOptions) error {
 		for _, a := range release.Assets {
 			if len(opts.FilePatterns) > 0 && !matchAny(opts.FilePatterns, a.Name) {
 				continue
+			}
+			// Note that if we need to start checking for reserved filenames on
+			// more operating systems we should move to using a build constraints
+			// pattern rather than checking the operating system at runtime.
+			if runtime.GOOS == "windows" && isWindowsReservedFilename(a.Name) {
+				return fmt.Errorf("unable to download release due to asset with reserved filename %q", a.Name)
 			}
 			toDownload = append(toDownload, a)
 		}
@@ -193,7 +206,7 @@ func downloadRun(opts *DownloadOptions) error {
 		stdout:       opts.IO.Out,
 	}
 
-	return downloadAssets(&dest, httpClient, toDownload, opts.Concurrency, isArchive)
+	return downloadAssets(&dest, httpClient, toDownload, opts.Concurrency, isArchive, opts.IO)
 }
 
 func matchAny(patterns []string, name string) bool {
@@ -205,7 +218,7 @@ func matchAny(patterns []string, name string) bool {
 	return false
 }
 
-func downloadAssets(dest *destinationWriter, httpClient *http.Client, toDownload []shared.ReleaseAsset, numWorkers int, isArchive bool) error {
+func downloadAssets(dest *destinationWriter, httpClient *http.Client, toDownload []shared.ReleaseAsset, numWorkers int, isArchive bool, io *iostreams.IOStreams) error {
 	if numWorkers == 0 {
 		return errors.New("the number of concurrent workers needs to be greater than 0")
 	}
@@ -220,6 +233,7 @@ func downloadAssets(dest *destinationWriter, httpClient *http.Client, toDownload
 	for w := 1; w <= numWorkers; w++ {
 		go func() {
 			for a := range jobs {
+				io.StartProgressIndicatorWithLabel(fmt.Sprintf("Downloading %s", a.Name))
 				results <- downloadAsset(dest, httpClient, a.APIURL, a.Name, isArchive)
 			}
 		}()
@@ -236,6 +250,8 @@ func downloadAssets(dest *destinationWriter, httpClient *http.Client, toDownload
 			downloadError = err
 		}
 	}
+
+	io.StopProgressIndicator()
 
 	return downloadError
 }
@@ -284,7 +300,7 @@ func downloadAsset(dest *destinationWriter, httpClient *http.Client, assetURL, f
 			return fmt.Errorf("unable to parse file name of archive: %w", err)
 		}
 		if serverFileName, ok := params["filename"]; ok {
-			fileName = serverFileName
+			fileName = filepath.Base(serverFileName)
 		} else {
 			return errors.New("unable to determine file name of archive")
 		}
@@ -353,29 +369,54 @@ func (w destinationWriter) check(fp string) error {
 	return nil
 }
 
-// Copy writes the data from r into a file specified by name
-func (w destinationWriter) Copy(name string, r io.Reader) error {
+// Copy writes the data from r into a file specified by name.
+func (w destinationWriter) Copy(name string, r io.Reader) (copyErr error) {
 	fp := w.makePath(name)
 	if fp == "-" {
-		_, err := io.Copy(w.stdout, r)
-		return err
+		_, copyErr = io.Copy(w.stdout, r)
+		return
 	}
-	if err := w.check(fp); err != nil {
-		return err
+	if copyErr = w.check(fp); copyErr != nil {
+		return
 	}
 
 	if dir := filepath.Dir(fp); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
+		if copyErr = os.MkdirAll(dir, 0755); copyErr != nil {
+			return
 		}
 	}
 
-	f, err := os.OpenFile(fp, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return err
+	var f *os.File
+	if f, copyErr = os.OpenFile(fp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); copyErr != nil {
+		return
 	}
-	defer f.Close()
 
-	_, err = io.Copy(f, r)
-	return err
+	defer func() {
+		if err := f.Close(); copyErr == nil && err != nil {
+			copyErr = err
+		}
+	}()
+
+	_, copyErr = io.Copy(f, r)
+	return
+}
+
+func isWindowsReservedFilename(filename string) bool {
+	// Windows terminals should prevent the creation of these files
+	// but that behavior is not enforced across terminals. Prevent
+	// the user from downloading files with these reserved names as
+	// they represent an exploit vector for bad actors.
+	// Reserved filenames defined at:
+	// https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file#win32-file-namespaces
+	reservedFilenames := []string{"CON", "PRN", "AUX", "NUL", "COM0",
+		"COM1", "COM2", "COM3", "COM4", "COM5",
+		"COM6", "COM7", "COM8", "COM9", "COM¹",
+		"COM²", "COM³", "LPT0", "LPT1", "LPT2",
+		"LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+		"LPT8", "LPT9", "LPT¹", "LPT²", "LPT³"}
+
+	// Normalize type case and remove file type extension from filename.
+	filename = strings.ToUpper(strings.Split(filename, ".")[0])
+
+	return slices.Contains(reservedFilenames, filename)
 }

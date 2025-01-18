@@ -10,12 +10,11 @@ import (
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/browser"
-	"github.com/cli/cli/v2/internal/config"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/text"
 	issueShared "github.com/cli/cli/v2/pkg/cmd/issue/shared"
-	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -25,7 +24,7 @@ import (
 
 type ListOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
 	Browser    browser.Browser
@@ -133,7 +132,7 @@ func listRun(opts *ListOptions) error {
 	}
 
 	issueState := strings.ToLower(opts.State)
-	if issueState == "open" && shared.QueryHasStateClause(opts.Search) {
+	if issueState == "open" && prShared.QueryHasStateClause(opts.Search) {
 		issueState = ""
 	}
 
@@ -228,7 +227,7 @@ func issueList(client *http.Client, repo ghrepo.Interface, filters prShared.Filt
 	}
 
 	var err error
-	meReplacer := shared.NewMeReplacer(apiClient, repo.RepoHost())
+	meReplacer := prShared.NewMeReplacer(apiClient, repo.RepoHost())
 	filters.Assignee, err = meReplacer.Replace(filters.Assignee)
 	if err != nil {
 		return nil, err

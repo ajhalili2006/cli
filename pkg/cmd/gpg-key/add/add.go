@@ -8,7 +8,7 @@ import (
 	"os"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
@@ -16,10 +16,11 @@ import (
 
 type AddOptions struct {
 	IO         *iostreams.IOStreams
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	HTTPClient func() (*http.Client, error)
 
 	KeyFile string
+	Title   string
 }
 
 func NewCmdAdd(f *cmdutil.Factory, runF func(*AddOptions) error) *cobra.Command {
@@ -50,6 +51,7 @@ func NewCmdAdd(f *cmdutil.Factory, runF func(*AddOptions) error) *cobra.Command 
 		},
 	}
 
+	cmd.Flags().StringVarP(&opts.Title, "title", "t", "", "Title for the new key")
 	return cmd
 }
 
@@ -77,9 +79,9 @@ func runAdd(opts *AddOptions) error {
 		return err
 	}
 
-	hostname, _ := cfg.DefaultHost()
+	hostname, _ := cfg.Authentication().DefaultHost()
 
-	err = gpgKeyUpload(httpClient, hostname, keyReader)
+	err = gpgKeyUpload(httpClient, hostname, keyReader, opts.Title)
 	if err != nil {
 		cs := opts.IO.ColorScheme()
 		if errors.Is(err, errScopesMissing) {
